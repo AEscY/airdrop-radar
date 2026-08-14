@@ -1,221 +1,183 @@
-# -*- coding: utf-8 -*-
 import os
-import asyncio
-import logging
-from datetime import datetime
-from contextlib import asynccontextmanager
-
 import httpx
-from fastapi import FastAPI, Request
+import asyncio
+from datetime import datetime
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Dict, Optional
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("AirdropRadar")
+# ------------------- 配置区 -------------------
+app = FastAPI()
+logger = lambda msg: print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-# ===== 全局状态 =====
-scan_count = 0
-last_scan_result = "从未执行"
+# 模拟数据库（生产环境请换成 Redis 或 SQLite）
+USER_WALLETS: Dict[str, str] = {}  # chat_id -> wallet_address
+SCAN_LOCK = False # 防止并发扫描导致 API 超限
 
-# ===== 模拟扫描函数（替换为真实爬虫逻辑） =====
-async def run_radar_and_push():
-    global scan_count, last_scan_result
-    token = os.environ.get("TG_BOT_TOKEN")
-    chat_id = os.environ.get("TG_CHAT_ID")
-    scan_count += 1
-    logger.info(f"🔄 第 {scan_count} 次扫描开始")
+# ------------------- 核心类定义 -------------------
+class AirdropItem(BaseModel):
+    name: str
+    chain: str
+    score: int
+    status: str
+    action_url: str = ""
+
+# ------------------- 模拟爬虫逻辑 -------------------
+async def mock_scraper(wallet: Optional[str] = None) -> list[AirdropItem]:
+    """模拟雷达扫描，如果有 wallet 则模拟“命中”"""
+    await asyncio.sleep(2) # 模拟网络延迟
     
-    # 模拟扫描
-    await asyncio.sleep(2)
-    total = 42  # 假设扫描了42个项目
-    new_signals = 1  # 假设发现1个新信号
-    last_scan_result = f"第{scan_count}次: 扫描{total}个, 推送{new_signals}条"
+    items = [
+        AirdropItem(name="MetaMask", chain="Ethereum, Ink", score=70, status="可领取"),
+        AirdropItem(name="ZKSync", chain="zkSync Era", score=65, status="待交互"),
+    ]
     
-    # 发送状态更新
-    if token and chat_id:
-        msg = (
-            f"✅ *扫描完成 | 第 {scan_count} 次*\n\n"
-            f"🔍 扫描项目: `{total}` 个\n"
-            f"📡 推送信号: `{new_signals}` 条\n"
-            f"⏰ 时间: `{datetime.now().strftime('%H:%M:%S')}`\n\n"
-            f"━━━━━━━━━━━━━\n"
-            f"🔴 系统运行中..."
-        )
-        await send_telegram(token, chat_id, msg)
-    return total
+    # 模拟：如果用户绑定了钱包，高亮显示特定项目
+    if wallet:
+        items.append(AirdropItem(name=f"专属大毛 ({wallet[:6]}...)", chain="Arbitrum", score=95, status="🔥 高优可领", action_url="https://example.com"))
+        
+    return items
 
-# ===== Telegram API 封装 =====
-async def send_telegram(token: str, chat_id: str, text: str, reply_markup=None):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(url, json=payload)
-        return resp.status_code == 200
-
-async def edit_telegram(token: str, chat_id: str, message_id: int, text: str, reply_markup=None):
-    url = f"https://api.telegram.org/bot{token}/editMessageText"
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(url, json=payload)
-        return resp.status_code == 200
-
-# ===== 命令处理器 =====
-async def handle_update(body: dict):
-    global scan_count, last_scan_result
+# ------------------- Telegram API 封装 -------------------
+async def send_telegram(chat_id: str, text: str, reply_markup=None):
     token = os.environ.get("TG_BOT_TOKEN")
-    if not token:
-        return
-
-    # 处理 callback_query
-    cb = body.get("callback_query")
-    if cb:
-        chat_id = cb["message"]["chat"]["id"]
-        msg_id = cb["message"]["message_id"]
-        data = cb["data"]
-
-        # 应答回调查询，消除加载动画
-        async with httpx.AsyncClient(timeout=5) as client:
-            await client.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery",
-                              json={"callback_query_id": cb["id"]})
-
-        if data == "cmd_menu":
-            # 点击 ☰ 菜单 → 显示操作面板
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "🔍 立即扫描", "callback_data": "action_scan"}],
-                    [{"text": "📊 查看状态", "callback_data": "action_status"}],
-                    [{"text": "❓ 帮助", "callback_data": "action_help"}]
-                ]
-            }
-            await edit_telegram(token, chat_id, msg_id, "☰ *请选择操作：*", keyboard)
-
-        elif data == "action_scan":
-            # 点击立即扫描
-            await edit_telegram(token, chat_id, msg_id, "⏳ *正在扫描空投，请稍候...*")
-            total = await run_radar_and_push()
-            # 更新面板
-            panel = (
-                f"✅ *扫描完成 | 第 {scan_count} 次*\n\n"
-                f"🔍 扫描项目: `{total}` 个\n"
-                f"📡 最近结果: `{last_scan_result}`\n"
-                f"⏰ 时间: `{datetime.now().strftime('%H:%M:%S')}`\n\n"
-                f"━━━━━━━━━━━━━\n"
-                f"🔴 系统运行中..."
-            )
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "🔍 再次扫描", "callback_data": "action_scan"}],
-                    [{"text": "📊 刷新面板", "callback_data": "action_status"}]
-                ]
-            }
-            await edit_telegram(token, chat_id, msg_id, panel, keyboard)
-
-        elif data == "action_status":
-            status = (
-                f"📊 *系统状态*\n\n"
-                f"扫描次数: `{scan_count}`\n"
-                f"最近结果: `{last_scan_result}`\n"
-                f"运行状态: ✅ 正常"
-            )
-            await edit_telegram(token, chat_id, msg_id, status, None)
-
-        elif data == "action_help":
-            help_text = (
-                "📖 *帮助*\n\n"
-                "• 点击 ☰ 菜单 打开控制台\n"
-                "• 点击 立即扫描 手动触发扫描\n"
-                "• 系统每15分钟自动扫描一次\n"
-                "• 发现高分空投自动推送"
-            )
-            await edit_telegram(token, chat_id, msg_id, help_text, None)
-        return
-
-    # 处理文本命令
-    msg = body.get("message")
-    if not msg:
-        return
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text", "").strip()
-
-    if text == "/start" or text == "/menu":
-        # 发送一条带“☰ 菜单”按钮的消息，按钮会显示在输入框正上方（ReplyKeyboardMarkup）
-        keyboard = {"keyboard": [[{"text": "☰ 菜单"}]], "resize_keyboard": True, "one_time_keyboard": False}
-        await send_telegram(token, chat_id,
-            "👋 *空投雷达已激活！*\n\n点击下方「☰ 菜单」按钮打开控制台：",
-            keyboard)
-    elif text == "☰ 菜单":
-        # 用户点击了输入框上方的“☰ 菜单”按钮 → 模拟 callback 处理
-        # 但由于这是 ReplyKeyboardMarkup 的按钮，我们无法直接 callback，只能当作普通文本处理
-        # 所以我们改为发送一条带内联按钮的新消息
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": "🔍 立即扫描", "callback_data": "action_scan"}],
-                [{"text": "📊 查看状态", "callback_data": "action_status"}],
-                [{"text": "❓ 帮助", "callback_data": "action_help"}]
-            ]
-        }
-        await send_telegram(token, chat_id, "☰ *空投雷达控制台*\n\n请选择操作：", keyboard)
-    elif text == "/scan":
-        await send_telegram(token, chat_id, "⏳ 正在扫描...")
-        total = await run_radar_and_push()
-        await send_telegram(token, chat_id, f"✅ 扫描完成！共检查 {total} 个项目。")
-    elif text == "/status":
-        await send_telegram(token, chat_id,
-            f"📊 *状态*\n扫描次数: {scan_count}\n最近结果: {last_scan_result}")
-    elif text == "/help":
-        await send_telegram(token, chat_id, "📖 帮助: /menu 打开菜单，/scan 立即扫描，/status 查看状态")
-
-# ===== FastAPI 生命周期 =====
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 启动中...")
-    token = os.environ.get("TG_BOT_TOKEN")
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    chat_id = os.environ.get("TG_CHAT_ID")
-
-    # 设置 Webhook
-    if token and render_url:
-        webhook_url = f"{render_url}/webhook"
+    if not token: return
+    try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(f"https://api.telegram.org/bot{token}/setWebhook",
-                                     json={"url": webhook_url})
-            if resp.status_code == 200:
-                logger.info(f"✅ Webhook 设置成功: {webhook_url}")
-            else:
-                logger.error(f"❌ Webhook 设置失败: {resp.text}")
+            await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "reply_markup": reply_markup}
+            )
+    except Exception as e:
+        logger(f"发送消息失败: {e}")
 
-    # 上线通知
-    if token and chat_id:
-        await send_telegram(token, chat_id,
-            f"🟢 *空投雷达已上线！*\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n发送 /menu 开始使用。")
+async def edit_telegram_message(chat_id: str, message_id: int, text: str, reply_markup=None):
+    token = os.environ.get("TG_BOT_TOKEN")
+    if not token: return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{token}/editMessageText",
+                json={"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown", "reply_markup": reply_markup}
+            )
+    except Exception as e:
+        logger(f"编辑消息失败: {e}")
 
-    # 定时扫描
-    async def periodic_scan():
-        while True:
-            try:
-                await run_radar_and_push()
-            except Exception as e:
-                logger.error(f"定时扫描异常: {e}")
-            await asyncio.sleep(900)
-    task = asyncio.create_task(periodic_scan())
-    logger.info("⏰ 定时扫描已启动 (每15分钟)")
-    yield
-    task.cancel()
+# ------------------- 菜单构建器 -------------------
+def build_main_keyboard(has_wallet: bool):
+    """动态构建键盘：如果没绑钱包，优先提示绑定"""
+    keyboard = []
+    if not has_wallet:
+        keyboard.append([{"text": "🔗 绑定钱包 (核心)", "callback_data": "cmd_bind"}])
+    else:
+        keyboard.append([{"text": "🔍 立即扫描", "callback_data": "cmd_scan"}])
+        keyboard.append([{"text": "💰 我的资产", "callback_data": "cmd_balance"}])
+        
+    keyboard.append([{"text": "⚙️ 设置过滤", "callback_data": "cmd_settings"}])
+    keyboard.append([{"text": "❓ 帮助", "callback_data": "cmd_help"}])
+    return {"inline_keyboard": keyboard}
 
-app = FastAPI(lifespan=lifespan)
+# ------------------- 命令处理逻辑 -------------------
+class TelegramUpdate(BaseModel):
+    message: Optional[dict] = None
+    callback_query: Optional[dict] = None
 
 @app.post("/webhook")
-async def webhook(request: Request):
-    body = await request.json()
-    asyncio.create_task(handle_update(body))
-    return {"ok": True}
+async def telegram_webhook(update: TelegramUpdate):
+    global SCAN_LOCK
+    
+    data = update.dict()
+    msg = data.get("message")
+    callback = data.get("callback_query")
+    token = os.environ.get("TG_BOT_TOKEN")
+    
+    if not token: raise HTTPException(status_code=500, detail="Token not set")
 
-@app.get("/")
-async def root():
-    return {"status": "running", "scans": scan_count, "last": last_scan_result}
+    # 1. 处理文本命令
+    if msg and msg.get("text"):
+        chat_id = msg["chat"]["id"]
+        text = msg["text"]
+        
+        if text == "/start":
+            await send_telegram(chat_id, 
+                "👋 *空投雷达 Pro 版*
+*升级亮点：支持钱包绑定 & 精准推送*
+                
+点击下方按钮开始：", 
+                build_main_keyboard(False)
+            )
+            
+        elif text == "/bind":
+            USER_WALLETS[str(chat_id)] = "0x123...abc" # 模拟绑定
+            await send_telegram(chat_id, "✅ 钱包模拟绑定成功！现在开始为您精准扫描。", build_main_keyboard(True))
+
+    # 2. 处理按钮回调 (核心交互逻辑)
+    elif callback:
+        query = callback["data"]
+        chat_id = callback["message"]["chat"]["id"]
+        msg_id = callback["message"]["message_id"]
+        
+        # --- 场景 A：用户点击了“立即扫描” ---
+        if query == "cmd_scan":
+            has_wallet = str(chat_id) in USER_WALLETS
+            
+            # 1. 立即回复，给用户反馈（防止超时）
+            await edit_telegram_message(chat_id, msg_id, "⏳ *正在全链扫描... 请稍候* ⏳")
+            
+            # 2. 异步执行耗时任务（这里用 asyncio.sleep 模拟爬虫）
+            # 注意：在真实环境中，这里应该使用 Background Tasks 或将任务放入队列
+            await asyncio.sleep(2) 
+            results = await mock_scraper(USER_WALLETS.get(str(chat_id)))
+            
+            # 3. 格式化结果
+            if not results:
+                reply = "🔍 *扫描完成*
+未发现新的高价值空投。"
+            else:
+                reply = "🔍 *扫描完成！发现新机会：*
+
+"
+                for item in results:
+                    reply += f"*[ {item.score}分 ]* `{item.name}`\n"
+                    reply += f"链: {item.chain} | 状态: {item.status}
+"
+                    if item.action_url:
+                        reply += f"[👉 立即操作]({item.action_url})
+"
+                    reply += "
+"
+            
+            # 4. 更新消息内容为结果
+            await edit_telegram_message(chat_id, msg_id, reply, build_main_keyboard(has_wallet))
+
+        # --- 场景 B：用户点击了“绑定钱包” ---
+        elif query == "cmd_bind":
+            await edit_telegram_message(chat_id, msg_id, 
+                "🔗 *钱包绑定向导*
+请提供您的 EVM 兼容地址 (0x...)：
+*(注：目前为演示模式，输入任意内容即视为绑定)*", 
+                {"inline_keyboard": [[{"text": "取消", "callback_data": "cmd_cancel"}]]}
+            )
+            # 真实场景下，这里需要设置一个状态标记，等待用户下一条消息
+
+        # --- 场景 C：其他菜单 ---
+        elif query == "cmd_help":
+            await edit_telegram_message(chat_id, msg_id, 
+                "📖 *帮助中心*
+`/start` - 启动雷达
+`/bind` - 绑定钱包获取专属信号
+`🔍 立即扫描` - 手动刷新数据"
+            )
+
+    return JSONResponse(content={"ok": True})
+
+# ------------------- 生命周期管理 -------------------
+@app.on_event("startup")
+async def startup_event():
+    logger("🚀 雷达 Pro 启动成功！")
+    # 设置 Webhook 逻辑可以在这里补充
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
