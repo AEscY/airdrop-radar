@@ -227,26 +227,46 @@ app = FastAPI()
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, app_tg.bot)
-    await app_tg.process_update(update)
+    try:
+        data = await request.json()
+        if not data:
+            logger.warning("Empty webhook data")
+            return Response(status_code=400)
+        # 日志记录收到更新
+        update_id = data.get('update_id', 'unknown')
+        logger.info(f"Webhook received, update_id: {update_id}")
+        # 使用 Application 处理更新
+        update = Update.de_json(data, app_tg.bot)
+        await app_tg.process_update(update)
+        return Response(status_code=200)
+    except Exception as e:
+        logger.error(f"Webhook processing error: {e}", exc_info=True)
+        return Response(status_code=500)
+
+@app.get("/")
+async def root():
+    return {"status": "running", "service": "Web3 Radar Ultimate"}
+
+@app.head("/")
+async def root_head():
     return Response(status_code=200)
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
-@app.get("/")
-async def root():
-    return "Web3 Radar Ultimate is running."
-
 @app.on_event("startup")
 async def startup():
+    # 创建数据库表
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # 设置 Webhook
     webhook_url = os.getenv("RENDER_EXTERNAL_URL", "https://default.onrender.com") + "/webhook"
     await app_tg.bot.set_webhook(webhook_url)
     logger.info(f"Webhook set to {webhook_url}")
+    # 打印当前 webhook 信息
+    info = await app_tg.bot.get_webhook_info()
+    logger.info(f"Current webhook info: {info}")
 
 # ---------- 独立采集模式（用于 GitHub Actions） ----------
 async def run_collect():
