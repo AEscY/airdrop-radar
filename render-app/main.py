@@ -10,14 +10,9 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request
 
-# ===== 日志配置 =====
-logging.basicConfig(
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger("AirdropRadar")
 
-# ===== 配置 =====
 ALPHA_DROPS_FREE = "https://alphadrops.net/free-crypto-airdrops"
 ALPHA_DROPS_BEST = "https://alphadrops.net/best-crypto-airdrops-2026"
 TELEGRAM_SEND = "https://api.telegram.org/bot{token}/sendMessage"
@@ -34,11 +29,9 @@ WATCH_PROJECTS = [
     "Arcus", "Nado", "Synq", "StandX", "Liquid", "Meridian"
 ]
 
-# ===== 全局状态 =====
 scan_count = 0
 last_scan_result = "从未执行"
 
-# ===== 评分引擎 =====
 def score_drop(name, funding_str, chains, is_claimable, is_premium):
     s = 0
     m = re.search(r"\$?([\d.]+)\s*([MB])?", funding_str or "")
@@ -60,7 +53,6 @@ def score_drop(name, funding_str, chains, is_claimable, is_premium):
         s += 8
     return int(s)
 
-# ===== 爬取 Alpha Drops =====
 async def fetch_alpha_drops():
     drops = []
     html_pages = []
@@ -69,9 +61,7 @@ async def fetch_alpha_drops():
             try:
                 resp = await client.get(
                     url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
-                    }
+                    headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"}
                 )
                 if resp.status_code == 200 and len(resp.text) > 3000:
                     html_pages.append(resp.text)
@@ -120,7 +110,6 @@ async def fetch_alpha_drops():
     logger.info(f"📊 去重后共 {len(unique)} 个项目")
     return unique
 
-# ===== 发送 Telegram 消息 =====
 async def send_telegram(token, chat_id, text):
     if not token or not chat_id:
         logger.error("❌ 缺少 TG_BOT_TOKEN 或 TG_CHAT_ID")
@@ -142,7 +131,6 @@ async def send_telegram(token, chat_id, text):
         logger.error(f"❌ Telegram 发送异常: {e}")
         return False
 
-# ===== 扫描并推送 =====
 async def run_radar_and_push():
     global scan_count, last_scan_result
     token = os.environ.get("TG_BOT_TOKEN")
@@ -171,17 +159,14 @@ async def run_radar_and_push():
     logger.info(f"✅ === 扫描完成: {last_scan_result} ===")
     return pushed
 
-# ===== 生命周期管理 =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 ===== Airdrop Radar 启动中 =====")
-    # 发送上线通知
     token = os.environ.get("TG_BOT_TOKEN")
     chat_id = os.environ.get("TG_CHAT_ID")
     if token and chat_id:
         await send_telegram(token, chat_id,
             f"🟢 *空投雷达已上线！*\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n每15分钟自动扫描一次。")
-    # 启动定时扫描
     async def periodic_scan():
         while True:
             try:
@@ -195,7 +180,6 @@ async def lifespan(app: FastAPI):
     task.cancel()
     logger.info("🛑 服务关闭")
 
-# ===== FastAPI 应用 =====
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
@@ -204,12 +188,7 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {
-        "service": "Airdrop Radar",
-        "status": "running",
-        "scans": scan_count,
-        "last_scan": last_scan_result
-    }
+    return {"service": "Airdrop Radar", "status": "running", "scans": scan_count, "last_scan": last_scan_result}
 
 @app.post("/collect")
 async def collect(request: Request):
