@@ -1,407 +1,365 @@
-# -*- coding: utf-8 -*-
-import os
-import re
+"""
+Airdrop Radar Bot - 多源聚合 + 链上监听 + 智能评分
+支持数据源：AlphaDrops, Binance Alpha, DropsEarn RSS, GitHub Trending
+兼容 SQLite / PostgreSQL
+"""
+
 import asyncio
 import logging
-from datetime import datetime
-from contextlib import asynccontextmanager
-from typing import Optional
+import os
+import re
+import sys
+import threading
+import time
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Any
+from contextlib import contextmanager
 
-import httpx
-from fastapi import FastAPI, Request
+import requests
+import feedparser
+from parsel import Selector
+from fastapi import FastAPI, Request, Response
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ===== 日志 =====
-logging.basicConfig(
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger("AirdropRadar")
+# ---------- 数据库适配层 ----------
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Boolean, Float
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
+import sqlite3
 
-# ===== 配置 =====
-ALPHA_API = "https://alphadrops.net/api/v1/airdrops"
-ALPHA_FREE_PAGE = "https://alphadrops.net/alpha"
-TELEGRAM_API = "https://api.telegram.org/bot{token}"
+# 日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# 监控的项目
-WATCH_KEYWORDS = [
-    "Infinex", "Based", "RateX", "Pharos", "Quote", "Arcus",
-    "Robinhood Perpl", "Ondo Perps", "xStocks", "Fomo", "JTX",
-    "Polymarket", "Pascal", "Titan", "Phoenix", "Monad",
-    "Berachain", "Grass", "MetaMask", "N1", "QFEX"
-]
+# ---------- 配置 ----------
+TOKEN = os.getenv("TG_BOT_TOKEN")
+CHAT_ID = os.getenv("TG_CHAT_ID")  # 默认推送目标
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///airdrop.db")  # 支持 PostgreSQL
+INFURA_PROJECT_ID = os.getenv("INFURA_PROJECT_ID")  # 可选，用于链上监听
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")  # 可选
 
-# ===== 全局状态 =====
-scan_count = 0
-last_scan_result = "从未执行"
-user_wallets = {}          # chat_id -> wallet address
-user_settings = {}         # chat_id -> {"min_score": 70, "chains": []}
-last_snapshot = {}         # 去重用
+# ---------- SQLAlchemy 模型 ----------
+Base = declarative_base()
 
-# ===== 评分引擎 =====
-def score_project(name: str, funding: str, is_claimable: bool, is_premium: bool, chains: list) -> int:
-    s = 0
-    m = re.search(r"\$?([\d.]+)\s*([MB])?", funding or "")
-    if m:
-        amt = float(m.group(1))
-        if m.group(2) == "B":
-            amt *= 1000
-        s += min(amt / 10, 30)
-    if is_claimable:
-        s += 25
-    if "Solana" in (chains or []):
-        s += 5
-    if is_premium:
-        s += 10
-    if is_claimable and funding:
-        s += 5
-    big_vc = ["Polymarket", "Fomo", "JTX", "Phoenix", "xStocks", "Ondo Perps", "Quote", "Pascal"]
-    if name in big_vc:
-        s += 8
-    return int(s)
+class PushedProject(Base):
+    __tablename__ = 'pushed'
+    name = Column(String, primary_key=True)
+    pushed_at = Column(DateTime, default=datetime.utcnow)
+    source = Column(String, default='alphadrops')
+    score = Column(Float, default=0.0)
 
-# ===== 数据抓取 =====
-async def fetch_airdrops() -> list:
-    """优先用 API，失败则降级到 HTML 解析"""
-    token = os.environ.get("ALPHA_API_KEY")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
-    }
+class User(Base):
+    __tablename__ = 'users'
+    user_id = Column(Integer, primary_key=True)
+    wallet_address = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-    # 尝试 API
-    if token:
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    ALPHA_API,
-                    headers={"Authorization": f"Bearer {token}"},
-                    params={"status": "active", "limit": 50}
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("success"):
-                        logger.info(f"✅ API 抓取成功: {len(data['data'])} 个项目")
-                        return data["data"]
-                else:
-                    logger.warning(f"⚠️ API 返回 {resp.status_code}，降级到 HTML")
-        except Exception as e:
-            logger.error(f"❌ API 调用失败: {e}")
+# 引擎和会话
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+Base.metadata.create_all(engine)
+SessionLocal = sessionmaker(bind=engine)
 
-    # 降级：HTML 解析
+@contextmanager
+def get_db():
+    db = SessionLocal()
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(ALPHA_FREE_PAGE, headers=headers)
-            if resp.status_code != 200:
-                logger.error(f"❌ HTML 抓取失败: {resp.status_code}")
-                return []
-            html = resp.text
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+# ---------- 数据源采集函数 ----------
+
+def fetch_alphadrops() -> List[Dict]:
+    """采集 AlphaDrops（改进：多重选择器回退）"""
+    url = "https://alphadrops.io/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        sel = Selector(text=resp.text)
+        projects = []
+        # 多重选择器尝试
+        selectors = [
+            ".project-item",
+            ".card-project",
+            "[class*='project']"
+        ]
+        items = []
+        for sel_str in selectors:
+            items = sel.css(sel_str)
+            if items:
+                break
+        if not items:
+            logger.warning("AlphaDrops: No items found with any selector")
+            return []
+
+        for item in items:
+            name = item.css(".project-name::text, .name::text, h4::text").get(default="").strip()
+            if not name:
+                continue
+            chain = item.css(".chain::text, .chain-tag::text, .badge-chain::text").get(default="").strip()
+            funding = item.css(".funding::text, .amount::text").get(default="").strip()
+            claimable_tag = item.css(".claimable::text, .status::text").get(default="")
+            claimable = bool(claimable_tag and ("claim" in claimable_tag.lower() or "available" in claimable_tag.lower()))
+            # 融资额解析
+            funding_val = 0.0
+            if funding:
+                match = re.search(r'[\d.]+', funding.replace(',', ''))
+                if match:
+                    funding_val = float(match.group())
+                    if 'B' in funding:
+                        funding_val *= 1000
+                    elif 'M' in funding:
+                        pass
+                    elif 'K' in funding:
+                        funding_val /= 1000
+            # 评分（可扩展）
+            score = 0.0
+            if funding_val > 0:
+                score += min(funding_val * 5, 50)
+            if claimable:
+                score += 20
+            if chain and chain.lower() in ["ethereum", "arbitrum", "optimism", "polygon", "zksync", "base"]:
+                score += 10
+
+            projects.append({
+                "name": name,
+                "chain": chain,
+                "funding": funding,
+                "claimable": claimable,
+                "score": score,
+                "url": item.css("a::attr(href)").get(),
+                "source": "alphadrops"
+            })
+        return projects
     except Exception as e:
-        logger.error(f"❌ HTML 抓取异常: {e}")
+        logger.error(f"AlphaDrops fetch error: {e}")
         return []
 
-    # 解析 HTML 中的项目
-    results = []
-    for kw in WATCH_KEYWORDS:
-        idx = html.find(kw)
-        if idx == -1:
-            continue
-        snippet = html[max(0, idx-200): idx+600]
-        funding_m = re.search(r"\$([\d.]+)\s*([MB])", snippet)
-        funding = f"${funding_m.group(1)}{funding_m.group(2)}" if funding_m else ""
-        chains = []
-        for c in ["Ethereum", "Solana", "Base", "Arbitrum", "Polygon", "Monad", "BNB", "Hyperliquid", "Sui", "Ink"]:
-            if c.lower() in snippet.lower():
-                chains.append(c)
-        is_claimable = "claimable" in snippet.lower()
-        is_premium = "Premium" in snippet
-        results.append({
-            "name": kw,
-            "funding_amount": funding,
-            "blockchains": chains,
-            "is_claimable": is_claimable,
-            "premium": is_premium
-        })
+def fetch_binance_alpha() -> List[Dict]:
+    """采集 Binance Alpha（模拟，实际需适配页面结构）"""
+    # 注意：Binance Alpha 页面需要动态加载，此函数为示例框架
+    # 实际可使用 Selenium 或 解析其API（若有）
+    # 这里返回空列表，如需实现请参考官方页面调整
+    logger.info("Binance Alpha fetch not implemented yet")
+    return []
 
-    # 去重
-    seen = {}
-    for r in results:
-        if r["name"] not in seen:
-            seen[r["name"]] = r
-    logger.info(f"📊 HTML 解析得到 {len(seen)} 个项目")
-    return list(seen.values())
-
-# ===== Telegram 封装 =====
-def _tg_url(token: str, method: str) -> str:
-    return f"{TELEGRAM_API.format(token=token)}/{method}"
-
-async def tg_request(token: str, method: str, payload: dict) -> Optional[dict]:
+def fetch_dropsearn_rss() -> List[Dict]:
+    """通过 RSS 获取 DropsEarn 数据"""
+    rss_url = "https://dropsearn.com/feed"  # 示例，实际需确认RSS地址
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(_tg_url(token, method), json=payload)
-            if resp.status_code == 200:
-                return resp.json()
-            else:
-                logger.error(f"❌ TG {method} 失败: {resp.status_code} {resp.text}")
-                return None
+        feed = feedparser.parse(rss_url)
+        projects = []
+        for entry in feed.entries[:20]:
+            title = entry.title
+            link = entry.link
+            published = entry.published
+            # 简单评分
+            score = 50  # 默认分
+            projects.append({
+                "name": title,
+                "chain": "Unknown",
+                "funding": "N/A",
+                "claimable": True,
+                "score": score,
+                "url": link,
+                "source": "dropsearn"
+            })
+        return projects
     except Exception as e:
-        logger.error(f"❌ TG {method} 异常: {e}")
-        return None
+        logger.error(f"DropsEarn RSS error: {e}")
+        return []
 
-async def send_message(token: str, chat_id: str, text: str, reply_markup=None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return await tg_request(token, "sendMessage", payload)
+def fetch_github_trending() -> List[Dict]:
+    """监控 GitHub Trending 中 web3 相关仓库"""
+    url = "https://github.com/trending?l=javascript&l=python&l=rust&l=go&q=web3"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        sel = Selector(text=resp.text)
+        repos = sel.css("article.Box-row")
+        projects = []
+        for repo in repos[:10]:
+            name = repo.css("h1 a::text").get(default="").strip().replace("\n", "").replace(" ", "")
+            if not name:
+                continue
+            desc = repo.css("p::text").get(default="").strip()
+            if "web3" in desc.lower() or "blockchain" in desc.lower():
+                score = 30  # 基础分
+                projects.append({
+                    "name": name,
+                    "chain": "GitHub",
+                    "funding": "N/A",
+                    "claimable": False,
+                    "score": score,
+                    "url": f"https://github.com/{name}",
+                    "source": "github"
+                })
+        return projects
+    except Exception as e:
+        logger.error(f"github trending error: {e}")
+        return []
 
-async def edit_message(token: str, chat_id: str, message_id: int, text: str, reply_markup=None):
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return await tg_request(token, "editMessageText", payload)
+# ---------- 链上监听（可选，需 Infura） ----------
+def fetch_onchain_contracts() -> List[Dict]:
+    """监听新 ERC-20 合约部署（简化版，需实现）"""
+    if not INFURA_PROJECT_ID:
+        return []
+    # 示例：使用 web3.py 监听 pending 交易中的合约创建
+    # 实际需要复杂逻辑，此处返回空
+    return []
 
-async def answer_callback(token: str, callback_id: str):
-    return await tg_request(token, "answerCallbackQuery", {"callback_query_id": callback_id})
+# ---------- 数据聚合与去重 ----------
+def collect_all_sources() -> List[Dict]:
+    """聚合所有数据源"""
+    all_projects = []
+    all_projects.extend(fetch_alphadrops())
+    all_projects.extend(fetch_binance_alpha())
+    all_projects.extend(fetch_dropsearn_rss())
+    all_projects.extend(fetch_github_trending())
+    all_projects.extend(fetch_onchain_contracts())
 
-async def set_my_commands(token: str):
-    """注册命令菜单（解决菜单问题）"""
-    commands = [
-        {"command": "start", "description": "🚀 启动雷达"},
-        {"command": "menu", "description": "📋 打开控制台"},
-        {"command": "scan", "description": "🔍 立即扫描一次"},
-        {"command": "status", "description": "📊 查看运行状态"},
-        {"command": "bind", "description": "🔗 绑定钱包地址"},
-        {"command": "settings", "description": "⚙️ 设置过滤条件"},
-        {"command": "help", "description": "❓ 帮助信息"},
-    ]
-    return await tg_request(token, "setMyCommands", {"commands": commands})
+    # 按名称去重（保留最高评分）
+    unique = {}
+    for p in all_projects:
+        name = p['name']
+        if name not in unique or p['score'] > unique[name]['score']:
+            unique[name] = p
+    return list(unique.values())
 
-# ===== 键盘构建 =====
-def main_keyboard():
-    return {
-        "inline_keyboard": [
-            [{"text": "🔍 立即扫描", "callback_data": "scan"}],
-            [
-                {"text": "📊 状态", "callback_data": "status"},
-                {"text": "⚙️ 设置", "callback_data": "settings"}
-            ],
-            [
-                {"text": "🔗 绑定钱包", "callback_data": "bind"},
-                {"text": "❓ 帮助", "callback_data": "help"}
-            ]
-        ]
-    }
+def filter_high_value(projects: List[Dict]) -> List[Dict]:
+    """筛选高价值（评分>=70 或 可领取且>=60）"""
+    return [p for p in projects if p["score"] >= 70 or (p["claimable"] and p["score"] >= 60)]
 
-def scan_result_keyboard():
-    return {
-        "inline_keyboard": [
-            [{"text": "🔍 再次扫描", "callback_data": "scan"}],
-            [{"text": "📋 返回菜单", "callback_data": "menu"}]
-        ]
-    }
+# ---------- 推送与去重 ----------
+def is_pushed(name: str) -> bool:
+    with get_db() as db:
+        return db.query(PushedProject).filter_by(name=name).first() is not None
 
-# ===== 扫描逻辑 =====
-async def run_scan_and_push():
-    global scan_count, last_scan_result, last_snapshot
-    token = os.environ.get("TG_BOT_TOKEN")
-    chat_id = os.environ.get("TG_CHAT_ID")
-    scan_count += 1
-    logger.info(f"🔄 === 第 {scan_count} 次扫描 ===")
+def mark_pushed(name: str, source: str, score: float):
+    with get_db() as db:
+        db.merge(PushedProject(name=name, source=source, score=score))
 
-    raw = await fetch_airdrops()
-    if not raw:
-        last_scan_result = f"第{scan_count}次: 0 个项目"
-        return 0
+def format_message(project: Dict) -> str:
+    msg = f"🚀 *{project['name']}*\n"
+    msg += f"🔗 Chain: {project['chain'] or 'Unknown'}\n"
+    msg += f"💰 Funding: {project['funding'] or 'N/A'}\n"
+    msg += f"🎁 Claimable: {'✅ Yes' if project['claimable'] else '❌ No'}\n"
+    msg += f"⭐ Score: {project['score']}\n"
+    msg += f"📡 Source: {project.get('source', 'unknown')}\n"
+    if project['url']:
+        msg += f"🔗 [More Info]({project['url']})"
+    return msg
 
-    # 评分 + 过滤
-    scored = []
-    for item in raw:
-        if item["name"] not in WATCH_KEYWORDS and not item.get("is_claimable"):
-            continue
-        sc = score_project(
-            item["name"],
-            item.get("funding_amount", ""),
-            item.get("is_claimable", False),
-            item.get("premium", False),
-            item.get("blockchains", [])
-        )
-        scored.append({**item, "score": sc})
+# ---------- Telegram Bot ----------
+application = Application.builder().token(TOKEN).build()
 
-    scored.sort(key=lambda x: x["score"], reverse=True)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🚀 Airdrop Radar Bot (Enhanced)\n"
+        "Commands:\n"
+        "/scan - Manual scan\n"
+        "/status - Stats\n"
+        "/bind <wallet> - Bind wallet"
+    )
 
-    # 去重推送
-    pushed = 0
-    for item in scored[:5]:
-        key = item["name"]
-        prev = last_snapshot.get(key, {})
-        changed = prev.get("is_claimable") != item["is_claimable"] or prev.get("score", 0) != item["score"]
-        if (changed and item["score"] >= 70) or (item["is_claimable"] and item["score"] >= 60):
-            name_esc = item["name"].replace("*", "\\*").replace("_", "\\_")
-            emoji = "🚨" if item["score"] >= 80 else "⚠️"
-            msg = f"{emoji} *[{item['score']}分] {name_esc}*\n"
-            msg += f"链: {', '.join(item.get('blockchains', [])) or 'N/A'}\n"
-            msg += f"融资: {item.get('funding_amount') or 'N/A'}\n"
-            msg += f"状态: {'✅ 可领取' if item.get('is_claimable') else '活跃'}"
-            ok = await send_message(token, chat_id, msg)
-            if ok:
-                pushed += 1
-            await asyncio.sleep(1)
-
-    # 更新快照
-    last_snapshot = {i["name"]: {"is_claimable": i.get("is_claimable", False), "score": i["score"]} for i in scored}
-    last_scan_result = f"第{scan_count}次: 扫描{len(raw)}个, 推送{pushed}条"
-    logger.info(f"✅ {last_scan_result}")
-    return len(raw)
-
-# ===== 处理更新 =====
-async def handle_update(body: dict):
-    global user_wallets, user_settings
-    token = os.environ.get("TG_BOT_TOKEN")
-    if not token:
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Scanning all sources...")
+    projects = collect_all_sources()
+    filtered = filter_high_value(projects)
+    if not filtered:
+        await update.message.reply_text("No high-value projects found.")
         return
+    sent = 0
+    for p in filtered[:10]:
+        if not is_pushed(p['name']):
+            await update.message.reply_text(format_message(p), parse_mode="Markdown", disable_web_page_preview=True)
+            mark_pushed(p['name'], p.get('source', 'unknown'), p['score'])
+            sent += 1
+    await update.message.reply_text(f"Done. Pushed {sent} new projects.")
 
-    # 回调按钮
-    cb = body.get("callback_query")
-    if cb:
-        chat_id = str(cb["message"]["chat"]["id"])
-        msg_id = cb["message"]["message_id"]
-        data = cb["data"]
-        await answer_callback(token, cb["id"])
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with get_db() as db:
+        pushed_count = db.query(PushedProject).count()
+        users_count = db.query(User).count()
+    await update.message.reply_text(f"📊 Total pushed: {pushed_count}\n👥 Users: {users_count}")
 
-        if data == "menu":
-            await edit_message(token, chat_id, msg_id,
-                "📋 *空投雷达控制台*\n\n点击下方按钮操作：", main_keyboard())
-
-        elif data == "scan":
-            await edit_message(token, chat_id, msg_id, "⏳ *正在扫描全链空投，请稍候...*")
-            total = await run_scan_and_push()
-            panel = (
-                f"✅ *扫描完成 | 第 {scan_count} 次*\n\n"
-                f"🔍 扫描项目: `{total}` 个\n"
-                f"📡 最近结果: `{last_scan_result}`\n"
-                f"⏰ 时间: `{datetime.now().strftime('%H:%M:%S')}`\n\n"
-                f"━━━━━━━━━━━━━\n🔴 系统运行中..."
-            )
-            await edit_message(token, chat_id, msg_id, panel, scan_result_keyboard())
-
-        elif data == "status":
-            status = (
-                f"📊 *系统状态*\n\n"
-                f"扫描次数: `{scan_count}`\n"
-                f"最近结果: `{last_scan_result}`\n"
-                f"绑定钱包: `{user_wallets.get(chat_id, '未绑定')}`\n"
-                f"运行状态: ✅ 正常"
-            )
-            await edit_message(token, chat_id, msg_id, status, main_keyboard())
-
-        elif data == "bind":
-            await edit_message(token, chat_id, msg_id,
-                "🔗 *绑定钱包*\n\n请直接发送你的 EVM 地址（0x 开头）：", None)
-
-        elif data == "settings":
-            await edit_message(token, chat_id, msg_id,
-                "⚙️ *过滤设置*\n\n"
-                "• 最低分数: 70 分\n"
-                "• 监控链: 全部\n\n"
-                "（完整设置功能开发中）", main_keyboard())
-
-        elif data == "help":
-            await edit_message(token, chat_id, msg_id,
-                "📖 *帮助*\n\n"
-                "`/start` 启动\n`/menu` 打开控制台\n`/scan` 立即扫描\n"
-                "`/status` 查看状态\n`/bind` 绑定钱包\n`/settings` 过滤设置",
-                main_keyboard())
+async def bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /bind <wallet_address>")
         return
+    wallet = context.args[0]
+    with get_db() as db:
+        db.merge(User(user_id=update.effective_user.id, wallet_address=wallet))
+    await update.message.reply_text(f"Wallet bound: {wallet}")
 
-    # 文本消息
-    msg = body.get("message")
-    if not msg:
-        return
-    chat_id = str(msg["chat"]["id"])
-    text = msg.get("text", "").strip()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("scan", scan))
+application.add_handler(CommandHandler("status", status))
+application.add_handler(CommandHandler("bind", bind))
 
-    # 处理钱包绑定（用户直接发送地址）
-    if text.startswith("0x") and len(text) > 10:
-        user_wallets[chat_id] = text
-        await send_message(token, chat_id, f"✅ 钱包绑定成功：\n`{text}`\n\n发送 /menu 打开控制台", main_keyboard())
-        return
-
-    if text == "/start" or text == "/menu":
-        await send_message(token, chat_id,
-            "👋 *空投雷达已激活！*\n\n发送 /menu 打开控制台，或点击输入框左侧的菜单按钮。",
-            main_keyboard())
-
-    elif text == "/scan":
-        await send_message(token, chat_id, "⏳ 正在扫描...")
-        total = await run_scan_and_push()
-        await send_message(token, chat_id, f"✅ 扫描完成！共检查 {total} 个项目。\n\n{last_scan_result}")
-
-    elif text == "/status":
-        await send_message(token, chat_id,
-            f"📊 *状态*\n扫描次数: {scan_count}\n最近: {last_scan_result}")
-
-    elif text == "/bind":
-        await send_message(token, chat_id, "🔗 请发送你的 EVM 地址（0x 开头）：")
-
-    elif text == "/help":
-        await send_message(token, chat_id,
-            "📖 *帮助*\n/start 启动\n/menu 控制台\n/scan 扫描\n/status 状态\n/bind 绑钱包")
-
-# ===== 生命周期 =====
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 ===== Airdrop Radar 启动 =====")
-    token = os.environ.get("TG_BOT_TOKEN")
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    chat_id = os.environ.get("TG_CHAT_ID")
-
-    # 1. 注册命令菜单（关键！让输入框左侧出现菜单按钮）
-    if token:
-        ok = await set_my_commands(token)
-        if ok:
-            logger.info("✅ 命令菜单注册成功")
-        # 2. 设置 Webhook
-        if render_url:
-            webhook_url = f"{render_url}/webhook"
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"{TELEGRAM_API.format(token=token)}/setWebhook",
-                    json={"url": webhook_url}
-                )
-                if resp.status_code == 200:
-                    logger.info(f"✅ Webhook 设置成功: {webhook_url}")
-                else:
-                    logger.error(f"❌ Webhook 失败: {resp.text}")
-        # 3. 上线通知
-        if chat_id:
-            await send_message(token, chat_id,
-                f"🟢 *空投雷达已上线！*\n\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                "每 15 分钟自动扫描一次。\n\n发送 /menu 打开控制台。")
-
-    # 4. 定时扫描
-    async def periodic():
-        while True:
-            try:
-                await run_scan_and_push()
-            except Exception as e:
-                logger.error(f"❌ 定时扫描异常: {e}")
-            await asyncio.sleep(900)
-    task = asyncio.create_task(periodic())
-    logger.info("⏰ 定时扫描已启动 (15分钟)")
-    yield
-    task.cancel()
-    logger.info("🛑 服务关闭")
-
-app = FastAPI(lifespan=lifespan)
+# ---------- FastAPI 服务 ----------
+app = FastAPI()
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    body = await request.json()
-    asyncio.create_task(handle_update(body))
-    return {"ok": True}
+    data = await request.json()
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return Response(status_code=200)
 
 @app.get("/health")
 async def health():
-    return {"status": "alive", "scans": scan_count, "last": last_scan_result}
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
+@app.get("/")
+async def root():
+    return "Airdrop Radar Bot (Enhanced) is running."
+
+@app.on_event("startup")
+async def on_startup():
+    webhook_url = os.getenv("RENDER_EXTERNAL_URL", "https://your-app.onrender.com") + "/webhook"
+    await application.bot.set_webhook(webhook_url)
+    await application.bot.set_my_commands([
+        ("start", "Start"),
+        ("scan", "Scan now"),
+        ("status", "Stats"),
+        ("bind", "Bind wallet")
+    ])
+    logger.info("Webhook set and commands registered.")
+
+# ---------- 独立运行模式（用于GitHub Actions） ----------
+def run_collect():
+    logger.info("Collect mode started...")
+    projects = collect_all_sources()
+    filtered = filter_high_value(projects)
+    sent = 0
+    for p in filtered:
+        if not is_pushed(p['name']):
+            asyncio.run(send_message(p))
+            mark_pushed(p['name'], p.get('source', 'unknown'), p['score'])
+            sent += 1
+            time.sleep(0.5)  # 防限流
+    logger.info(f"Collect finished. Pushed {sent} new projects.")
+
+async def send_message(project):
+    bot = application.bot
+    try:
+        await bot.send_message(chat_id=CHAT_ID, text=format_message(project), parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Send error: {e}")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    if len(sys.argv) > 1 and sys.argv[1] == "--collect":
+        run_collect()
+    else:
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
