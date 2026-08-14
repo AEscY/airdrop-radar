@@ -3,7 +3,9 @@ import os
 import re
 import json
 import asyncio
-from fastapi import FastAPI, Request
+import hashlib
+import hmac
+from fastapi import FastAPI, Request, Response
 import httpx
 from datetime import datetime
 
@@ -12,7 +14,6 @@ app = FastAPI()
 # ========== 配置 ==========
 ALPHA_DROPS_FREE = "https://alphadrops.net/free-crypto-airdrops"
 ALPHA_DROPS_BEST = "https://alphadrops.net/best-crypto-airdrops-2026"
-DROPS_API = "https://api.drops.bot/shared/v1/airdrops/{network}/{address}"
 TELEGRAM_SEND = "https://api.telegram.org/bot{token}/sendMessage"
 
 WATCH_PROJECTS = [
@@ -57,7 +58,7 @@ async def fetch_alpha_drops():
                 resp = await client.get(
                     url,
                     headers={
-                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
                     }
                 )
                 if resp.status_code == 200 and len(resp.text) > 3000:
@@ -105,40 +106,11 @@ async def fetch_alpha_drops():
             seen[d["name"]] = d
     return list(seen.values())
 
-async def check_wallet_drops(address, api_key):
-    if not address or not api_key:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.get(
-                DROPS_API.format(network="evm", address=address),
-                headers={"x-api-key": api_key}
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                result = []
-                for item in data.get("data", []):
-                    result.append({
-                        "name": item.get("airdropName", "Unknown"),
-                        "usdValue": item.get("usdValue", 0),
-                        "addressUrl": item.get("addressUrl", ""),
-                        "isExpiringSoon": item.get("isExpiringSoon", False)
-                    })
-                return result
-    except Exception:
-        pass
-    return []
-
-async def notify(token, chat_id, text):
+async def send_telegram(token, chat_id, text, parse_mode="Markdown"):
     async with httpx.AsyncClient(timeout=10) as client:
         await client.post(
             TELEGRAM_SEND.format(token=token),
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "Markdown"
-            },
-            headers={"Content-Type": "application/json; charset=utf-8"}
+            json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
         )
 
 async def kv_get(env, key):
@@ -182,8 +154,6 @@ async def run_radar():
     env = dict(os.environ)
     token = env.get("TG_BOT_TOKEN")
     chat_id = env.get("TG_CHAT_ID")
-    wallet = env.get("WATCH_WALLET")
-    drops_api_key = env.get("DROPS_API_KEY")
     drops = await fetch_alpha_drops()
     prev_raw = await kv_get(env, "last_snapshot")
     prev = json.loads(prev_raw) if prev_raw else {}
@@ -206,26 +176,58 @@ async def run_radar():
         if d["premium"]:
             msg += f"级别: Premium\n"
         msg += f"来源: alphadrops.net"
-        await notify(token, chat_id, msg)
+        await send_telegram(token, chat_id, msg)
         pushed += 1
         await asyncio.sleep(0.5)
-    if wallet and drops_api_key:
-        wallet_drops = await check_wallet_drops(wallet, drops_api_key)
-        for wd in wallet_drops:
-            if wd["usdValue"] > 0 or wd["isExpiringSoon"]:
-                emoji = "💰" if wd["usdValue"] > 0 else "⏰"
-                msg = f"{emoji} 钱包空投: {wd['name']}\n"
-                msg += f"估值: ${wd['usdValue']}\n"
-                if wd["isExpiringSoon"]:
-                    msg += f"⚠️ 即将过期!\n"
-                msg += f"详情: {wd['addressUrl']}"
-                await notify(token, chat_id, msg)
-                await asyncio.sleep(0.5)
     snapshot = {d["name"]: {"is_claimable": d["is_claimable"], "score": d["score"]} for d in drops}
     await kv_put(env, "last_snapshot", json.dumps(snapshot, ensure_ascii=False))
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return f"OK: 扫描 {len(drops)} 个空投，推送 {pushed} 条新信号，时间 {now}"
 
+# ========== Telegram Webhook 处理 ==========
+async def handle_telegram_update(body: dict, env: dict):
+    """处理来自 Telegram 的更新"""
+    token = env.get("TG_BOT_TOKEN")
+    if not token:
+        return
+
+    # 解析消息
+    message = body.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text", "").strip()
+
+    if not chat_id or not text:
+        return
+
+    # 处理 /menu 命令
+    if text == "/menu":
+        menu_text = (
+            "🤖 *空投雷达菜单*\n\n"
+            "🔍 `/scan` - 立即扫描最新空投\n"
+            "📊 `/status` - 查看系统状态\n"
+            "ℹ️ `/help` - 帮助信息"
+        )
+        await send_telegram(token, chat_id, menu_text)
+    elif text == "/scan":
+        # 执行扫描并返回结果
+        result = await run_radar()
+        await send_telegram(token, chat_id, f"扫描完成:\n{result}")
+    elif text == "/status":
+        await send_telegram(token, chat_id, "✅ 系统运行正常，每15分钟自动扫描一次。")
+    elif text == "/help":
+        help_text = (
+            "可用命令:\n"
+            "/menu - 显示菜单\n"
+            "/scan - 立即扫描空投\n"
+            "/status - 查看状态\n"
+            "/help - 帮助"
+        )
+        await send_telegram(token, chat_id, help_text)
+    else:
+        # 未知命令
+        await send_telegram(token, chat_id, f"未知命令: {text}\n请输入 /menu 查看可用命令。")
+
+# ========== FastAPI 端点 ==========
 @app.get("/health")
 async def health():
     return {"status": "alive", "ts": datetime.now().isoformat()}
@@ -243,12 +245,27 @@ async def manual_run():
     result = await run_radar()
     return {"result": result}
 
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    """接收 Telegram 的 Webhook 更新"""
+    # 验证 secret_token（可选）
+    env = dict(os.environ)
+    secret = env.get("WEBHOOK_SECRET")
+    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret and header_secret != secret:
+        return Response(status_code=403)
+
+    body = await request.json()
+    # 异步处理，不阻塞响应
+    asyncio.create_task(handle_telegram_update(body, env))
+    return {"ok": True}
+
 @app.get("/")
 async def root():
     return {
-        "service": "Airdrop Radar",
+        "service": "Airdrop Radar + Interactive Bot",
         "status": "running",
-        "endpoints": ["/health", "/run", "/collect"]
+        "endpoints": ["/health", "/run", "/collect", "/webhook"]
     }
 
 if __name__ == "__main__":
