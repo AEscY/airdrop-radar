@@ -1,13 +1,18 @@
-name: 极速采集 (每5分钟)
+name: 高频采集 (每5分钟)
+
 on:
-  schedule: [{cron: '*/5 * * * *'}]
+  schedule:
+    - cron: '*/5 * * * *'
   workflow_dispatch:
+
 jobs:
   collect:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5 with: {python-version: '3.11'}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - run: pip install -r render-app/requirements.txt
       - run: python render-app/main.py --collect
         env:
