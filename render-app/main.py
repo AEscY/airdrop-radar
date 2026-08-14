@@ -58,13 +58,11 @@ async def get_db():
 
 # ---------- 数据采集：异步并发 ----------
 async def fetch_alphadrops(client: httpx.AsyncClient) -> List[Project]:
-    """从 AlphaDrops 采集项目（增强健壮性）"""
     try:
         resp = await client.get("https://alphadrops.io/", timeout=12.0)
         resp.raise_for_status()
         from parsel import Selector
         sel = Selector(text=resp.text)
-        # 多重选择器
         items = sel.css(".project-item, .card-project, [class*='project']")
         projects = []
         for item in items[:20]:
@@ -76,14 +74,12 @@ async def fetch_alphadrops(client: httpx.AsyncClient) -> List[Project]:
             claimable_tag = item.css(".claimable::text, .status::text").get(default="")
             claimable = bool(claimable_tag and ("claim" in claimable_tag.lower() or "available" in claimable_tag.lower()))
             
-            # 评分（可根据融资额、公链、可领取性加权）
             score = 50.0
             if any(x in chain.lower() for x in ["ethereum", "arbitrum", "optimism", "polygon", "base"]):
                 score += 20
             if claimable:
                 score += 30
             if funding and '$' in funding:
-                # 简单判断金额大小
                 import re
                 nums = re.findall(r'[\d.]+', funding.replace(',', ''))
                 if nums:
@@ -117,7 +113,6 @@ async def fetch_alphadrops(client: httpx.AsyncClient) -> List[Project]:
         return []
 
 async def fetch_github_trending() -> List[Project]:
-    """从 GitHub Trending 获取 web3 相关仓库"""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get("https://github.com/trending?l=python&l=javascript&q=web3", timeout=10.0)
@@ -144,12 +139,10 @@ async def fetch_github_trending() -> List[Project]:
         return []
 
 async def collect_all() -> List[Project]:
-    """并发采集所有数据源，去重并排序"""
     async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}) as client:
         tasks = [
             fetch_alphadrops(client),
             fetch_github_trending(),
-            # 未来可添加更多数据源函数
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
     
@@ -160,12 +153,10 @@ async def collect_all() -> List[Project]:
         else:
             logger.error(f"Collect error: {res}")
     
-    # 按名称去重，保留最高评分
     unique = {}
     for p in all_projects:
         if p.name not in unique or p.score > unique[p.name].score:
             unique[p.name] = p
-    # 按评分降序
     return sorted(unique.values(), key=lambda x: x.score, reverse=True)
 
 # ---------- 消息格式化 ----------
@@ -182,7 +173,6 @@ def format_project(p: Project) -> str:
 
 # ---------- 推送与去重 ----------
 async def send_project(p: Project, bot):
-    """发送单个项目到 Telegram，并去重"""
     async for db in get_db():
         stmt = select(PushedProject).where(PushedProject.name == p.name)
         exists = (await db.execute(stmt)).scalar_one_or_none()
@@ -211,16 +201,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ 正在并发采集全网数据...")
     projects = await collect_all()
-    filtered = [p for p in projects if p.score >= 60]  # 阈值
+    filtered = [p for p in projects if p.score >= 60]
     if not filtered:
         await msg.edit_text("暂无高分项目。")
         return
 
     count = 0
-    for p in filtered[:10]:  # 限制单次推送数量
+    for p in filtered[:10]:
         if await send_project(p, app_tg.bot):
             count += 1
-            await asyncio.sleep(0.5)  # 防频率限制
+            await asyncio.sleep(0.5)
     await update.message.reply_text(f"✅ 扫描完成，新增推送 {count} 个项目。")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -252,10 +242,8 @@ async def root():
 
 @app.on_event("startup")
 async def startup():
-    # 创建数据库表
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    # 设置 Webhook
     webhook_url = os.getenv("RENDER_EXTERNAL_URL", "https://default.onrender.com") + "/webhook"
     await app_tg.bot.set_webhook(webhook_url)
     logger.info(f"Webhook set to {webhook_url}")
