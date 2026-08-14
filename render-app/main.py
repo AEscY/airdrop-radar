@@ -3,15 +3,19 @@ import os
 import re
 import json
 import asyncio
-import hashlib
-import hmac
-from fastapi import FastAPI, Request, Response
-import httpx
+import logging
 from datetime import datetime
+from threading import Thread
 
-app = FastAPI()
+from fastapi import FastAPI, Request
+import httpx
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ========== 配置 ==========
+# ===== 配置 =====
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 ALPHA_DROPS_FREE = "https://alphadrops.net/free-crypto-airdrops"
 ALPHA_DROPS_BEST = "https://alphadrops.net/best-crypto-airdrops-2026"
 TELEGRAM_SEND = "https://api.telegram.org/bot{token}/sendMessage"
@@ -28,6 +32,7 @@ WATCH_PROJECTS = [
     "Arcus", "Nado", "Synq", "StandX", "Liquid", "Meridian"
 ]
 
+# ===== 评分引擎 =====
 def score_drop(name, funding_str, chains, is_claimable, is_premium):
     s = 0
     m = re.search(r"\$?([\d.]+)\s*([MB])?", funding_str or "")
@@ -49,6 +54,7 @@ def score_drop(name, funding_str, chains, is_claimable, is_premium):
         s += 8
     return int(s)
 
+# ===== 爬取 Alpha Drops =====
 async def fetch_alpha_drops():
     drops = []
     html_pages = []
@@ -106,6 +112,7 @@ async def fetch_alpha_drops():
             seen[d["name"]] = d
     return list(seen.values())
 
+# ===== 发送 Telegram 消息（直接 API）=====
 async def send_telegram(token, chat_id, text, parse_mode="Markdown"):
     async with httpx.AsyncClient(timeout=10) as client:
         await client.post(
@@ -113,62 +120,15 @@ async def send_telegram(token, chat_id, text, parse_mode="Markdown"):
             json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
         )
 
-async def kv_get(env, key):
-    account_id = env.get("KV_ACCOUNT_ID")
-    namespace_id = env.get("KV_NAMESPACE_ID")
-    api_token = env.get("CF_API_TOKEN")
-    if not all([account_id, namespace_id, api_token]):
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/{key}",
-                headers={"Authorization": f"Bearer {api_token}"}
-            )
-            if r.status_code == 200:
-                return r.text
-    except Exception:
-        pass
-    return None
-
-async def kv_put(env, key, value):
-    account_id = env.get("KV_ACCOUNT_ID")
-    namespace_id = env.get("KV_NAMESPACE_ID")
-    api_token = env.get("CF_API_TOKEN")
-    if not all([account_id, namespace_id, api_token]):
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.put(
-                f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/{key}",
-                content=value.encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {api_token}",
-                    "Content-Type": "application/octet-stream"
-                }
-            )
-    except Exception:
-        pass
-
-async def run_radar():
-    env = dict(os.environ)
-    token = env.get("TG_BOT_TOKEN")
-    chat_id = env.get("TG_CHAT_ID")
+# ===== 扫描并推送 =====
+async def run_radar_and_push(token, chat_id):
     drops = await fetch_alpha_drops()
-    prev_raw = await kv_get(env, "last_snapshot")
-    prev = json.loads(prev_raw) if prev_raw else {}
-    new_signals = []
-    for d in drops:
-        key = d["name"]
-        prev_item = prev.get(key, {})
-        changed = (prev_item.get("is_claimable") != d["is_claimable"] or
-                   prev_item.get("score", 0) != d["score"])
-        if (changed and d["score"] >= 70) or (d["is_claimable"] and d["score"] >= 60):
-            new_signals.append(d)
+    # 简单去重：只推送分数>=70或可领取的
+    new_signals = [d for d in drops if d["score"] >= 75 or d["is_claimable"]]
     new_signals.sort(key=lambda x: x["score"], reverse=True)
     pushed = 0
     for d in new_signals[:5]:
-        emoji = "🚨" if d["score"] >= 80 else "⚠️"
+        emoji = "🚨" if d["score"] >= 90 else "⚠️" if d["score"] >= 80 else "📊"
         msg = f"{emoji} [{d['score']}分] {d['name']}\n"
         msg += f"链: {', '.join(d['blockchains']) or 'N/A'}\n"
         msg += f"融资: {d['funding_amount'] or 'N/A'}\n"
@@ -179,95 +139,121 @@ async def run_radar():
         await send_telegram(token, chat_id, msg)
         pushed += 1
         await asyncio.sleep(0.5)
-    snapshot = {d["name"]: {"is_claimable": d["is_claimable"], "score": d["score"]} for d in drops}
-    await kv_put(env, "last_snapshot", json.dumps(snapshot, ensure_ascii=False))
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return f"OK: 扫描 {len(drops)} 个空投，推送 {pushed} 条新信号，时间 {now}"
+    return len(drops), pushed
 
-# ========== Telegram Webhook 处理 ==========
-async def handle_telegram_update(body: dict, env: dict):
-    """处理来自 Telegram 的更新"""
-    token = env.get("TG_BOT_TOKEN")
-    if not token:
-        return
+# ===== Telegram Bot 命令处理 =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("欢迎使用空投雷达！发送 /menu 查看选项。")
 
-    # 解析消息
-    message = body.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "").strip()
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🔍 立即扫描", callback_data='scan')],
+        [InlineKeyboardButton("📊 查看状态", callback_data='status')],
+        [InlineKeyboardButton("ℹ️ 帮助", callback_data='help')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("请选择操作：", reply_markup=reply_markup)
 
-    if not chat_id or not text:
-        return
-
-    # 处理 /menu 命令
-    if text == "/menu":
-        menu_text = (
-            "🤖 *空投雷达菜单*\n\n"
-            "🔍 `/scan` - 立即扫描最新空投\n"
-            "📊 `/status` - 查看系统状态\n"
-            "ℹ️ `/help` - 帮助信息"
-        )
-        await send_telegram(token, chat_id, menu_text)
-    elif text == "/scan":
-        # 执行扫描并返回结果
-        result = await run_radar()
-        await send_telegram(token, chat_id, f"扫描完成:\n{result}")
-    elif text == "/status":
-        await send_telegram(token, chat_id, "✅ 系统运行正常，每15分钟自动扫描一次。")
-    elif text == "/help":
-        help_text = (
-            "可用命令:\n"
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == 'scan':
+        await query.edit_message_text("⏳ 正在扫描空投...")
+        token = os.environ.get("TG_BOT_TOKEN")
+        chat_id = query.message.chat_id
+        total, pushed = await run_radar_and_push(token, chat_id)
+        await query.edit_message_text(f"✅ 扫描完成！共检查 {total} 个项目，推送 {pushed} 条新信号。")
+    elif query.data == 'status':
+        await query.edit_message_text("✅ 系统正常运行，每15分钟自动扫描一次。")
+    elif query.data == 'help':
+        await query.edit_message_text(
+            "可用命令：\n"
             "/menu - 显示菜单\n"
-            "/scan - 立即扫描空投\n"
+            "/scan - 立即扫描\n"
             "/status - 查看状态\n"
             "/help - 帮助"
         )
-        await send_telegram(token, chat_id, help_text)
-    else:
-        # 未知命令
-        await send_telegram(token, chat_id, f"未知命令: {text}\n请输入 /menu 查看可用命令。")
 
-# ========== FastAPI 端点 ==========
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ 正在扫描空投...")
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = update.message.chat_id
+    total, pushed = await run_radar_and_push(token, chat_id)
+    await update.message.reply_text(f"✅ 扫描完成！共检查 {total} 个项目，推送 {pushed} 条新信号。")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ 系统正常运行，每15分钟自动扫描一次。")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "可用命令：\n"
+        "/menu - 显示菜单\n"
+        "/scan - 立即扫描\n"
+        "/status - 查看状态\n"
+        "/help - 帮助"
+    )
+
+# ===== 启动 Telegram Bot（Polling 模式）=====
+def start_bot():
+    token = os.environ.get("TG_BOT_TOKEN")
+    if not token:
+        logger.error("未设置 TG_BOT_TOKEN，机器人无法启动")
+        return
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CommandHandler("scan", scan_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    logger.info("Telegram Bot 启动中...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# ===== 定时扫描任务（每15分钟）=====
+async def periodic_scan():
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = os.environ.get("TG_CHAT_ID")
+    if not token or not chat_id:
+        logger.warning("未设置 TG_BOT_TOKEN 或 TG_CHAT_ID，定时扫描停止")
+        return
+    while True:
+        logger.info("执行定时扫描...")
+        total, pushed = await run_radar_and_push(token, chat_id)
+        logger.info(f"定时扫描完成：{total} 个项目，推送 {pushed} 条")
+        await asyncio.sleep(900)  # 15分钟
+
+# ===== FastAPI 应用 =====
+app = FastAPI()
+
+@app.on_event("startup")
+async def startup():
+    # 启动 Telegram Bot 线程
+    t = Thread(target=start_bot, daemon=True)
+    t.start()
+    # 启动定时扫描任务
+    asyncio.create_task(periodic_scan())
+
 @app.get("/health")
 async def health():
-    return {"status": "alive", "ts": datetime.now().isoformat()}
+    return {"status": "alive"}
 
 @app.post("/collect")
 async def collect(request: Request):
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {os.environ.get('RENDER_SECRET')}":
         return {"error": "unauthorized"}, 401
-    result = await run_radar()
-    return {"result": result}
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = os.environ.get("TG_CHAT_ID")
+    total, pushed = await run_radar_and_push(token, chat_id)
+    return {"result": f"OK: 扫描 {total} 个空投，推送 {pushed} 条新信号"}
 
 @app.get("/run")
 async def manual_run():
-    result = await run_radar()
-    return {"result": result}
-
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    """接收 Telegram 的 Webhook 更新"""
-    # 验证 secret_token（可选）
-    env = dict(os.environ)
-    secret = env.get("WEBHOOK_SECRET")
-    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if secret and header_secret != secret:
-        return Response(status_code=403)
-
-    body = await request.json()
-    # 异步处理，不阻塞响应
-    asyncio.create_task(handle_telegram_update(body, env))
-    return {"ok": True}
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = os.environ.get("TG_CHAT_ID")
+    total, pushed = await run_radar_and_push(token, chat_id)
+    return {"result": f"OK: 扫描 {total} 个空投，推送 {pushed} 条新信号"}
 
 @app.get("/")
 async def root():
-    return {
-        "service": "Airdrop Radar + Interactive Bot",
-        "status": "running",
-        "endpoints": ["/health", "/run", "/collect", "/webhook"]
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    return {"service": "Airdrop Radar + Bot", "status": "running"}
