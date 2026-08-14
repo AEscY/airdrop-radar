@@ -1,14 +1,23 @@
-name: Collect Airdrop Intel
+name: Collect and Notify
+
 on:
   schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
+    - cron: '*/15 * * * *'   # 每15分钟执行
+  workflow_dispatch:         # 手动触发
+
 jobs:
   collect:
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger Render Collect Endpoint
-        run: |
-          curl -X POST "${{ secrets.RENDER_URL }}/collect" \
-            -H "Authorization: Bearer ${{ secrets.RENDER_SECRET }}" \
-            -f || echo "Trigger failed, but continuing"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install -r render-app/requirements.txt
+      - run: python render-app/main.py --collect
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}  # 可选，如未配置则使用SQLite
+          INFURA_PROJECT_ID: ${{ secrets.INFURA_PROJECT_ID }}
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
