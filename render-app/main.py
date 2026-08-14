@@ -1,157 +1,229 @@
+# -*- coding: utf-8 -*-
 import os
+import re
 import json
 import asyncio
-import httpx
 import logging
-from datetime import datetime, timezone
-from fastapi import FastAPI, Request
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
-# ========== 日志配置 ==========
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
+import httpx
+from fastapi import FastAPI, Request
 
-# ========== 全局变量 ==========
-bot_initialized = False
+# ===== 日志配置 =====
+logging.basicConfig(
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger("AirdropRadar")
+
+# ===== 配置 =====
+ALPHA_DROPS_FREE = "https://alphadrops.net/free-crypto-airdrops"
+ALPHA_DROPS_BEST = "https://alphadrops.net/best-crypto-airdrops-2026"
+TELEGRAM_SEND = "https://api.telegram.org/bot{token}/sendMessage"
+
+WATCH_PROJECTS = [
+    "Infinex", "Based", "RateX", "Pharos Network", "ETHGAS", "Lighter",
+    "Superform", "Rainbow",
+    "Quote", "Arcus", "Robinhood Perpl", "Ondo Perps", "xStocks", "Fomo",
+    "JTX", "Tori Finance", "Bulk", "Polymarket", "Pacifica", "QFEX",
+    "N1", "Upshift",
+    "Cambria", "Backpack", "Monad", "Berachain", "Perpl", "Orbinum",
+    "Canopy", "Hypertrade", "Velvet", "Plume", "Grass", "MetaMask",
+    "Pascal", "Titan", "Phoenix", "Extended", "Hylo", "RateX",
+    "Arcus", "Nado", "Synq", "StandX", "Liquid", "Meridian"
+]
+
+# ===== 全局状态 =====
 scan_count = 0
-last_scan_result = "Pending..."
+last_scan_result = "从未执行"
 
-# ========== 模拟你的环境 ==========
-# 如果你的真实库是 python-telegram-bot，把下面的 send_telegram 函数换成它的用法
-# 这里先用 httpx 模拟发送，确保你能立刻收到消息
-async def send_telegram(message: str):
+# ===== 评分引擎 =====
+def score_drop(name, funding_str, chains, is_claimable, is_premium):
+    s = 0
+    m = re.search(r"\$?([\d.]+)\s*([MB])?", funding_str or "")
+    if m:
+        amt = float(m.group(1))
+        if m.group(2) == "B":
+            amt *= 1000
+        s += min(amt / 10, 30)
+    if is_claimable:
+        s += 25
+    if "Solana" in (chains or []):
+        s += 5
+    if is_premium:
+        s += 10
+    if is_claimable and funding_str:
+        s += 5
+    big_vc = ["Polymarket", "Fomo", "JTX", "Phoenix", "xStocks", "Ondo Perps", "Quote"]
+    if name in big_vc:
+        s += 8
+    return int(s)
+
+# ===== 爬取 Alpha Drops =====
+async def fetch_alpha_drops():
+    drops = []
+    html_pages = []
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        for url in [ALPHA_DROPS_FREE, ALPHA_DROPS_BEST]:
+            try:
+                resp = await client.get(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+                    }
+                )
+                if resp.status_code == 200 and len(resp.text) > 3000:
+                    html_pages.append(resp.text)
+                    logger.info(f"✅ 抓取成功: {url} ({len(resp.text)} bytes)")
+                else:
+                    logger.warning(f"⚠️ 抓取返回 {resp.status_code}: {url}")
+            except Exception as e:
+                logger.error(f"❌ 抓取失败 {url}: {e}")
+                continue
+    if not html_pages:
+        logger.error("❌ 所有页面抓取均失败")
+        return []
+    combined_html = "\n".join(html_pages)
+    logger.info(f"📄 合并 HTML 总长度: {len(combined_html)}")
+    for name in WATCH_PROJECTS:
+        idx = combined_html.find(name)
+        if idx == -1:
+            continue
+        ctx_start = max(0, idx - 300)
+        ctx_end = min(len(combined_html), idx + 900)
+        ctx = combined_html[ctx_start:ctx_end]
+        funding_match = re.search(r"\$([\d.]+)\s*([MB])", ctx)
+        funding = ""
+        if funding_match:
+            funding = f"${funding_match.group(1)}{funding_match.group(2)}"
+        chains = []
+        for chain in ["Solana", "Ethereum", "Base", "Arbitrum", "Polygon",
+                       "Abstract", "Monad", "BNB", "Hyperliquid", "Ink", "Sui"]:
+            if chain.lower() in ctx.lower():
+                chains.append(chain)
+        chains = list(dict.fromkeys(chains))
+        is_claimable = "claimable" in ctx.lower()
+        is_premium = "premium" in ctx.lower()
+        sc = score_drop(name, funding, chains, is_claimable, is_premium)
+        drops.append({
+            "name": name, "funding_amount": funding,
+            "blockchains": chains, "is_claimable": is_claimable,
+            "premium": is_premium, "score": sc
+        })
+        logger.info(f"  📌 {name} | 分数:{sc} | 可领取:{is_claimable} | 链:{chains}")
+    seen = {}
+    for d in drops:
+        if d["name"] not in seen:
+            seen[d["name"]] = d
+    unique = list(seen.values())
+    logger.info(f"📊 去重后共 {len(unique)} 个项目")
+    return unique
+
+# ===== 发送 Telegram 消息 =====
+async def send_telegram(token, chat_id, text):
+    if not token or not chat_id:
+        logger.error("❌ 缺少 TG_BOT_TOKEN 或 TG_CHAT_ID")
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                TELEGRAM_SEND.format(token=token),
+                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
+            if resp.status_code == 200:
+                logger.info(f"✅ Telegram 推送成功 ({len(text)} chars)")
+                return True
+            else:
+                logger.error(f"❌ Telegram 推送失败: {resp.status_code} {resp.text}")
+                return False
+    except Exception as e:
+        logger.error(f"❌ Telegram 发送异常: {e}")
+        return False
+
+# ===== 扫描并推送 =====
+async def run_radar_and_push():
+    global scan_count, last_scan_result
     token = os.environ.get("TG_BOT_TOKEN")
     chat_id = os.environ.get("TG_CHAT_ID")
-    
-    if not token or not chat_id:
-        logger.error("❌ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID")
-        return
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code == 200:
-                logger.info(f"✅ [Telegram] 发送成功: {message[:30]}...")
-            else:
-                logger.error(f"❌ [Telegram] 发送失败: {resp.text}")
-    except Exception as e:
-        logger.error(f"❌ [Telegram] 发送异常: {e}")
-
-# ========== 核心业务逻辑 ==========
-async def fetch_data():
-    """抓取 Alphadrops 数据"""
-    url = "https://api.alphadrops.net/drops"
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, timeout=15)
-            data = r.json()
-            return data.get("drops", [])
-    except Exception as e:
-        logger.error(f"❌ 抓取数据失败: {e}")
-        return []
-
-async def run_radar_logic():
-    """雷达扫描逻辑"""
-    global scan_count, last_scan_result
-    
-    logger.info("⚙️ 开始执行空投雷达扫描...")
     scan_count += 1
-    
-    drops = await fetch_data()
-    high_value = []
-    
-    for d in drops:
-        score = d.get("score", 0)
-        claimable = d.get("isClaimable", False)
-        name = d.get("name", "N/A")
-        
-        # 筛选逻辑：分数大于 70 且可领取
-        if score >= 70 and claimable:
-            high_value.append({
-                "name": name,
-                "score": score,
-                "chain": d.get("blockchain", "N/A"),
-                "url": f"https://alphadrops.net/drops/{d.get('slug')}"
-            })
+    logger.info(f"🔄 === 第 {scan_count} 次扫描开始 ===")
+    drops = await fetch_alpha_drops()
+    if not drops:
+        last_scan_result = f"第{scan_count}次: 抓取0个项目"
+        logger.warning("⚠️ 未抓到任何项目")
+        return 0
+    new_signals = [d for d in drops if d["score"] >= 75 or d["is_claimable"]]
+    new_signals.sort(key=lambda x: x["score"], reverse=True)
+    pushed = 0
+    for d in new_signals[:5]:
+        emoji = "🚨" if d["score"] >= 90 else "⚠️" if d["score"] >= 80 else "📊"
+        msg = f"{emoji} [{d['score']}分] *{d['name']}*\n"
+        msg += f"链: {', '.join(d['blockchains']) or 'N/A'}\n"
+        msg += f"融资: {d['funding_amount'] or 'N/A'}\n"
+        msg += f"状态: {'✅ 可领取' if d['is_claimable'] else '活跃'}"
+        ok = await send_telegram(token, chat_id, msg)
+        if ok:
+            pushed += 1
+        await asyncio.sleep(1)
+    last_scan_result = f"第{scan_count}次: 扫描{len(drops)}个, 推送{pushed}条"
+    logger.info(f"✅ === 扫描完成: {last_scan_result} ===")
+    return pushed
 
-    # 推送消息
-    if high_value:
-        msg = "🔥 <b>【高价值空投预警】</b>
-
-"
-        for item in high_value[:5]:
-            msg += f"<b>{item['name']}</b>
-"
-            msg += f• 评分: <code>{item['score']}</code> | 链: {item['chain']}
-"
-            msg += f"<a href='{item['url']}'>👉 点击直达领取</a>
-
-"
-        await send_telegram(msg)
-        last_scan_result = f"发现 {len(high_value)} 个高价值空投"
-        logger.info(last_scan_result)
-    else:
-        last_scan_result = "未发现符合条件的高价值空投"
-        logger.info(last_scan_result)
-
-# ========== Lifespan 管理 (替代多线程) ==========
+# ===== 生命周期管理 =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # --- 启动时执行 ---
     logger.info("🚀 ===== Airdrop Radar 启动中 =====")
-    
-    # 1. 发送上线通知
-    await send_telegram("🟢 <b>系统已上线</b>
-空投雷达服务已启动，开始为你监控最新空投。")
-    
-    # 2. 启动定时扫描任务 (使用 asyncio 原生任务，避开多线程陷阱)
-    async def periodic_task():
+    # 发送上线通知
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = os.environ.get("TG_CHAT_ID")
+    if token and chat_id:
+        await send_telegram(token, chat_id,
+            f"🟢 *空投雷达已上线！*\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n每15分钟自动扫描一次。")
+    # 启动定时扫描
+    async def periodic_scan():
         while True:
-            await run_radar_logic()
-            await asyncio.sleep(900) # 15分钟
-            
-    task = asyncio.create_task(periodic_task())
-    logger.info("⏰ 定时扫描任务已在后台运行 (每15分钟一次)")
+            try:
+                await run_radar_and_push()
+            except Exception as e:
+                logger.error(f"❌ 定时扫描异常: {e}")
+            await asyncio.sleep(900)
+    task = asyncio.create_task(periodic_scan())
+    logger.info("⏰ 定时扫描任务已启动 (每15分钟)")
     yield
-    # --- 关闭时执行 ---
     task.cancel()
-    logger.info("🛑 服务关闭，定时任务已停止")
+    logger.info("🛑 服务关闭")
 
-# ========== FastAPI 应用 ==========
+# ===== FastAPI 应用 =====
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 async def health():
+    return {"status": "alive", "scans": scan_count, "last": last_scan_result}
+
+@app.get("/")
+async def root():
     return {
-        "status": "alive", 
-        "scans": scan_count, 
-        "last": last_scan_result,
-        "uptime": datetime.now(timezone.utc).isoformat()
+        "service": "Airdrop Radar",
+        "status": "running",
+        "scans": scan_count,
+        "last_scan": last_scan_result
     }
 
 @app.post("/collect")
 async def collect(request: Request):
-    """供 GitHub Actions 或手动触发的接口"""
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {os.environ.get('RENDER_SECRET')}":
         return {"error": "unauthorized"}, 401
-    
-    logger.info("🚀 收到 /collect 手动触发请求")
-    await run_radar_logic()
-    return {"result": "Manual scan completed"}
+    pushed = await run_radar_and_push()
+    return {"result": f"OK: 推送 {pushed} 条信号"}
 
-@app.get("/")
-async def root():
-    return {"service": "Airdrop Radar", "status": "running", "docs": "/docs"}
+@app.get("/run")
+async def manual_run():
+    pushed = await run_radar_and_push()
+    return {"result": f"OK: 推送 {pushed} 条信号"}
 
-# ========== 本地测试入口 ==========
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
